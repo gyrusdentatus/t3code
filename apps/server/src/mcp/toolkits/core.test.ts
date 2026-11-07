@@ -373,7 +373,11 @@ it.effect("rejects an unknown organize target instead of archiving the calling t
     expect(dispatched).toEqual([]);
     expect(outcome).toMatchObject({
       _tag: "Failure",
-      failure: { message: expect.stringContaining("Expected no excess property") },
+      failure: {
+        message: expect.stringMatching(
+          /Not an argument of t3_thread_organize.*\n {2}at \["threadIds"\]/,
+        ),
+      },
     });
   }).pipe(
     Effect.provide(

@@ -8,6 +8,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import type * as SchemaAST from "effect/SchemaAST";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import type * as Types from "effect/Types";
@@ -455,15 +456,48 @@ const saveScreenshot = Effect.fn("McpHttpServer.saveScreenshot")(function* (
   return screenshotPath;
 });
 
-/** Decode with the advertised JSON codec, which permits null for optional fields that the raw schema rejects. */
+const unexpectedArgumentMessage = (tool: Tool.Any) => {
+  const { properties } = advertisedJsonSchema(tool) as { readonly properties?: object };
+  const accepted = Object.keys(properties ?? {});
+  return accepted.length === 0
+    ? `${tool.name} takes no arguments`
+    : `Not an argument of ${tool.name}, which accepts: ${accepted.join(", ")}`;
+};
+
+const advertisedParameters = (tool: Tool.Any) =>
+  Schema.toCodecJson(tool.parametersSchema).annotate({
+    messageUnexpectedKey: unexpectedArgumentMessage(tool),
+  });
+
+/**
+ * Decode with the advertised JSON codec, which permits null for optional fields that the raw schema rejects.
+ * Strict, so an argument the tool does not define is refused by name instead of silently dropped.
+ */
 const decodeAsAdvertised = <Tools extends Record<string, Tool.Any>>(
   toolkit: Toolkit.Toolkit<Tools>,
 ): Toolkit.Toolkit<Tools> =>
   Toolkit.make(
     ...Object.values(toolkit.tools).map((tool) =>
-      tool.setParameters(Schema.toCodecJson(tool.parametersSchema)),
+      tool.setParameters(advertisedParameters(tool)).annotate(Tool.Strict, true),
     ),
   ) as unknown as Toolkit.Toolkit<Tools>;
+
+/** Tools added without `McpServer.registerToolkit` decode their arguments as it does for a strict tool. */
+const strictArguments = <T extends Tool.Any>(tool: T) => {
+  const decode = Schema.decodeUnknownEffect(advertisedParameters(tool)) as (
+    input: unknown,
+    options: SchemaAST.ParseOptions,
+  ) => Effect.Effect<Tool.Parameters<T>, Schema.SchemaError>;
+  return (payload: unknown) =>
+    decode(payload ?? {}, { onExcessProperty: "error", errors: "all" }).pipe(
+      Effect.mapError(
+        (error) =>
+          new McpSchema.InvalidParams({
+            message: `Invalid parameters for tool '${tool.name}': ${error.message}`,
+          }),
+      ),
+    );
+};
 
 const isPreviewAutomationError = Schema.is(PreviewAutomationError);
 
@@ -513,6 +547,7 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
   >();
   const built = yield* decodeAsAdvertised(PreviewSnapshotToolkit);
   const tool = PreviewSnapshotTool;
+  const decodeArguments = strictArguments(tool);
   yield* server.addTool({
     tool: new McpSchema.Tool({
       name: tool.name,
@@ -531,92 +566,94 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
     }),
     annotations: tool.annotations,
     handle: (payload) =>
-      Effect.withFiber((fiber) => {
-        const invocation = Context.getUnsafe(
-          fiber.context,
-          McpInvocationContext.McpInvocationContext,
-        );
-        return built.handle("preview_snapshot", payload).pipe(
-          Stream.unwrap,
-          Stream.run(Sink.last()),
-          Effect.flatMap(Effect.fromOption),
-          Effect.provideService(PreviewAutomationBroker.PreviewAutomationBroker, broker),
-          Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
-          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
-          Effect.flatMap(({ encodedResult }) =>
-            Effect.gen(function* () {
-              const snapshot = encodedResult as SnapshotMetadata & {
-                readonly url: string;
-                readonly screenshot: {
-                  readonly mimeType: "image/png";
-                  readonly data: string;
-                  readonly width: number;
-                  readonly height: number;
+      Effect.flatMap(decodeArguments(payload), (args) =>
+        Effect.withFiber((fiber) => {
+          const invocation = Context.getUnsafe(
+            fiber.context,
+            McpInvocationContext.McpInvocationContext,
+          );
+          return built.handle("preview_snapshot", args).pipe(
+            Stream.unwrap,
+            Stream.run(Sink.last()),
+            Effect.flatMap(Effect.fromOption),
+            Effect.provideService(PreviewAutomationBroker.PreviewAutomationBroker, broker),
+            Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.flatMap(({ encodedResult }) =>
+              Effect.gen(function* () {
+                const snapshot = encodedResult as SnapshotMetadata & {
+                  readonly url: string;
+                  readonly screenshot: {
+                    readonly mimeType: "image/png";
+                    readonly data: string;
+                    readonly width: number;
+                    readonly height: number;
+                  };
                 };
-              };
-              const { screenshot, ...page } = snapshot;
-              const png = new Uint8Array(Buffer.from(screenshot.data, "base64"));
-              const screenshotPath =
-                payload?.save === true ? yield* saveScreenshot(snapshot.url, png) : undefined;
-              // Providers replay images on later requests, and some reject them; include images only when requested.
-              const includeImage = payload?.includeImage === true;
-              if (screenshotPath !== undefined && !includeImage) {
-                const saved = {
-                  url: cutText(snapshot.url, MAX_SNAPSHOT_IDENTIFIER_CHARS),
-                  screenshotPath,
+                const { screenshot, ...page } = snapshot;
+                const png = new Uint8Array(Buffer.from(screenshot.data, "base64"));
+                const screenshotPath =
+                  args.save === true ? yield* saveScreenshot(snapshot.url, png) : undefined;
+                // Providers replay images on later requests, and some reject them; include images only when requested.
+                const includeImage = args.includeImage === true;
+                if (screenshotPath !== undefined && !includeImage) {
+                  const saved = {
+                    url: cutText(snapshot.url, MAX_SNAPSHOT_IDENTIFIER_CHARS),
+                    screenshotPath,
+                  };
+                  return new McpSchema.CallToolResult({
+                    isError: false,
+                    structuredContent: saved,
+                    content: [{ type: "text", text: encodeJsonText(saved) }],
+                  });
+                }
+                const metadata = {
+                  ...page,
+                  screenshot: {
+                    mimeType: screenshot.mimeType,
+                    width: screenshot.width,
+                    height: screenshot.height,
+                  },
+                  ...(screenshotPath === undefined ? {} : { screenshotPath }),
                 };
+                const bounded = boundSnapshotMetadata(metadata);
                 return new McpSchema.CallToolResult({
                   isError: false,
-                  structuredContent: saved,
-                  content: [{ type: "text", text: encodeJsonText(saved) }],
+                  structuredContent:
+                    bounded.omitted.length === 0
+                      ? bounded.value
+                      : { ...bounded.value, omitted: bounded.omitted },
+                  content: [
+                    {
+                      type: "text",
+                      text: encodeJsonText({
+                        url: cutText(snapshot.url, MAX_SNAPSHOT_IDENTIFIER_CHARS),
+                      }),
+                    },
+                    { type: "text", text: bounded.text },
+                    ...(bounded.omitted.length === 0
+                      ? []
+                      : [
+                          {
+                            type: "text" as const,
+                            text: `Snapshot text was bounded. Omitted: ${bounded.omitted.join("; ")}.`,
+                          },
+                        ]),
+                    ...(includeImage
+                      ? [{ type: "image" as const, data: png, mimeType: screenshot.mimeType }]
+                      : []),
+                  ],
                 });
-              }
-              const metadata = {
-                ...page,
-                screenshot: {
-                  mimeType: screenshot.mimeType,
-                  width: screenshot.width,
-                  height: screenshot.height,
-                },
-                ...(screenshotPath === undefined ? {} : { screenshotPath }),
-              };
-              const bounded = boundSnapshotMetadata(metadata);
-              return new McpSchema.CallToolResult({
-                isError: false,
-                structuredContent:
-                  bounded.omitted.length === 0
-                    ? bounded.value
-                    : { ...bounded.value, omitted: bounded.omitted },
-                content: [
-                  {
-                    type: "text",
-                    text: encodeJsonText({
-                      url: cutText(snapshot.url, MAX_SNAPSHOT_IDENTIFIER_CHARS),
-                    }),
-                  },
-                  { type: "text", text: bounded.text },
-                  ...(bounded.omitted.length === 0
-                    ? []
-                    : [
-                        {
-                          type: "text" as const,
-                          text: `Snapshot text was bounded. Omitted: ${bounded.omitted.join("; ")}.`,
-                        },
-                      ]),
-                  ...(includeImage
-                    ? [{ type: "image" as const, data: png, mimeType: screenshot.mimeType }]
-                    : []),
-                ],
-              });
+              }),
+            ),
+            Effect.provide(saveServices),
+            Effect.matchCauseEffect({
+              onFailure: previewSnapshotFailure,
+              onSuccess: Effect.succeed,
             }),
-          ),
-          Effect.provide(saveServices),
-          Effect.matchCauseEffect({
-            onFailure: previewSnapshotFailure,
-            onSuccess: Effect.succeed,
-          }),
-        );
-      }),
+          );
+        }),
+      ),
   });
 });
 
@@ -685,7 +722,7 @@ const registerImageTool = Effect.fn("McpHttpServer.registerImageTool")(function*
   R,
 >(
   tool: T,
-  handle: (payload: Tool.Parameters<T>) => Effect.Effect<{ readonly encodedResult: unknown }, E, R>,
+  handle: (args: Tool.Parameters<T>) => Effect.Effect<{ readonly encodedResult: unknown }, E, R>,
   provide: (
     effect: Effect.Effect<{ readonly encodedResult: unknown }, E, R>,
   ) => Effect.Effect<
@@ -697,6 +734,7 @@ const registerImageTool = Effect.fn("McpHttpServer.registerImageTool")(function*
   failureText: string | ((error: E) => string),
 ) {
   const server = yield* McpServer.McpServer;
+  const decodeArguments = strictArguments(tool);
   yield* server.addTool({
     tool: new McpSchema.Tool({
       name: tool.name,
@@ -715,50 +753,45 @@ const registerImageTool = Effect.fn("McpHttpServer.registerImageTool")(function*
     }),
     annotations: tool.annotations,
     handle: (payload) =>
-      Effect.withFiber((fiber) => {
-        const invocation = Context.getUnsafe(
-          fiber.context,
-          McpInvocationContext.McpInvocationContext,
-        );
-        return provide(handle(payload as Tool.Parameters<T>)).pipe(
-          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
-          Effect.matchCauseEffect({
-            onFailure: imageToolFailure(tool.name, operation, failureText),
-            onSuccess: ({ encodedResult }) => {
-              const { screenshot, ...rest } = encodedResult as ImageToolResult;
-              const includeImage =
-                (payload as { readonly includeImage?: boolean } | undefined)?.includeImage !==
-                false;
-              const metadata = {
-                ...rest,
-                screenshot: {
-                  mimeType: screenshot.mimeType,
-                  width: screenshot.width,
-                  height: screenshot.height,
-                },
-              };
-              return Effect.succeed(
-                new McpSchema.CallToolResult({
-                  isError: false,
-                  structuredContent: metadata,
-                  content: [
-                    { type: "text", text: JSON.stringify(metadata) },
-                    ...(includeImage
-                      ? [
-                          {
-                            type: "image" as const,
-                            data: new Uint8Array(Buffer.from(screenshot.data, "base64")),
-                            mimeType: screenshot.mimeType,
-                          },
-                        ]
-                      : []),
-                  ],
-                }),
-              );
-            },
-          }),
-        );
-      }),
+      Effect.flatMap(decodeArguments(payload), (args) =>
+        Effect.withFiber((fiber) => {
+          const invocation = Context.getUnsafe(
+            fiber.context,
+            McpInvocationContext.McpInvocationContext,
+          );
+          return provide(handle(args)).pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.matchCauseEffect({
+              onFailure: imageToolFailure(tool.name, operation, failureText),
+              onSuccess: ({ encodedResult }) => {
+                const { screenshot, ...rest } = encodedResult as ImageToolResult;
+                const metadata = {
+                  ...rest,
+                  screenshot: {
+                    mimeType: screenshot.mimeType,
+                    width: screenshot.width,
+                    height: screenshot.height,
+                  },
+                };
+                return Effect.succeed(
+                  new McpSchema.CallToolResult({
+                    isError: false,
+                    structuredContent: metadata,
+                    content: [
+                      { type: "text", text: JSON.stringify(metadata) },
+                      {
+                        type: "image",
+                        data: new Uint8Array(Buffer.from(screenshot.data, "base64")),
+                        mimeType: screenshot.mimeType,
+                      },
+                    ],
+                  }),
+                );
+              },
+            }),
+          );
+        }),
+      ),
   });
 });
 
@@ -768,9 +801,9 @@ const registerDeviceScreenshot = Effect.fn("McpHttpServer.registerDeviceScreensh
   const built = yield* decodeAsAdvertised(DeviceScreenshotToolkit);
   yield* registerImageTool(
     DeviceScreenshotTool,
-    (payload) =>
+    (args) =>
       built
-        .handle("device_screenshot", payload)
+        .handle("device_screenshot", args)
         .pipe(Stream.unwrap, Stream.run(Sink.last()), Effect.flatMap(Effect.fromOption)),
     (effect) =>
       effect.pipe(
@@ -798,9 +831,9 @@ const registerHtmlPreview = Effect.fn("McpHttpServer.registerHtmlPreview")(funct
   const built = yield* decodeAsAdvertised(HtmlPreviewToolkit);
   yield* registerImageTool(
     HtmlPreviewTool,
-    (payload) =>
+    (args) =>
       built
-        .handle("html_preview", payload)
+        .handle("html_preview", args)
         .pipe(Stream.unwrap, Stream.run(Sink.last()), Effect.flatMap(Effect.fromOption)),
     (effect) =>
       effect.pipe(
