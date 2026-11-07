@@ -470,6 +470,23 @@ it.effect("advertises the compact input schema for every registered tool", () =>
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("refuses an argument preview_snapshot does not define before it runs", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const inputs = yield* serveSnapshots("mcp-strict-client", snapshotResult);
+
+      const refused = yield* Effect.flip(callSnapshot({ includeImages: true }));
+      expect(refused.message).toContain("Not an argument of preview_snapshot");
+      expect(refused.message).toContain('at ["includeImages"]');
+      expect(inputs).toEqual([]);
+
+      const snapshot = yield* callSnapshot({ includeImage: true });
+      expect(snapshot.isError).toBe(false);
+      expect(snapshot.content.at(-1)).toMatchObject({ type: "image" });
+    }),
+  ).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("checks each preview_act action against that action's own input", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -507,6 +524,27 @@ it.effect("decodes null optional arguments the way it decodes omitted ones", () 
     expect(calls[1]).toEqual(calls[0]);
     expect(calls[3]).toEqual(calls[2]);
     expect(calls[4]).toStrictEqual({ projectId: "project-1", projectIcon: null });
+  }).pipe(Effect.provide(layerRecordingTools(calls)));
+});
+
+it.effect("refuses an argument the tool does not define, naming it and what it accepts", () => {
+  const calls: Array<unknown> = [];
+  return Effect.gen(function* () {
+    const unknown = yield* Effect.flip(
+      callTool("delegate_task", { task: "Inspect", target: {}, dm: true, cc: "x" }),
+    );
+    expect(unknown.message).toMatch(/Not an argument of delegate_task, which accepts: .*\btask\b/);
+    expect(unknown.message).toContain('at ["dm"]');
+    expect(unknown.message).toContain('at ["cc"]');
+
+    const nested = yield* Effect.flip(
+      callTool("delegate_task", { task: "Inspect", target: { modell: "x" } }),
+    );
+    expect(nested.message).toContain('at ["target"]["modell"]');
+    expect(calls).toEqual([]);
+
+    yield* callTool("delegate_task", { task: "Inspect", target: {} });
+    expect(calls).toHaveLength(1);
   }).pipe(Effect.provide(layerRecordingTools(calls)));
 });
 
