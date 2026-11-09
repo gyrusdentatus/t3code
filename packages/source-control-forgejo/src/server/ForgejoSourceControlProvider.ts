@@ -1,5 +1,8 @@
-import { SourceControlProviderKind } from "@t3tools/contracts";
+import { SourceControlProviderKind, type ChangeRequest } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import * as Result from "effect/Result";
@@ -265,6 +268,27 @@ const cloneUrls = (raw: typeof RepositorySchema.Type) => ({
   url: raw.clone_url,
   sshUrl: raw.ssh_url,
 });
+// Forgejo ignores `head=` on the pulls listing, so finding a branch's pull requests means walking
+// the whole recentupdate-sorted state=all list. Any edit, close or merge moves a pull request to
+// the top, so the last walk's answer is reused per process while page 1 still starts the same way.
+// Deletions and same-second updates are invisible to that check; MEMO_MAX_AGE_MS bounds them.
+const HEAD_MEMO_LIMIT = 64;
+const MEMO_MAX_AGE_MS = 15 * 60 * 1000;
+type HeadWalk = {
+  readonly top: string;
+  readonly at: number;
+  readonly complete: boolean;
+  readonly results: ReadonlyArray<ChangeRequest>;
+};
+const headMemo = new Map<string, HeadWalk>();
+const rememberHeadWalk = (key: string, entry: HeadWalk) => {
+  headMemo.delete(key);
+  headMemo.set(key, entry);
+  if (headMemo.size > HEAD_MEMO_LIMIT) {
+    const oldest = headMemo.keys().next();
+    if (!oldest.done) headMemo.delete(oldest.value);
+  }
+};
 const repositoryPath = (repository: string) =>
   `repos/${repository.split("/").map(encodeURIComponent).join("/")}`;
 
@@ -332,16 +356,42 @@ export const make = Effect.gen(function* () {
         const repo = yield* cli.resolveRepository(input);
         const source = SourceControlProvider.sourceControlRefFromInput(input);
         const branch = SourceControlProvider.sourceBranch(input);
-        const results: ReturnType<typeof toForgejoChangeRequest>[] = [];
         const limit = input.limit ?? 20;
-        for (let page = 1; results.length < limit; page++) {
-          const items = yield* request(
+        const wanted = (item: ChangeRequest) => input.state === "all" || item.state === input.state;
+        const memoKey = [
+          repo.baseUrl,
+          repo.repository,
+          branch,
+          source?.owner ?? "",
+          source?.repository ?? "",
+        ].join("\u0000");
+        const readPage = (page: number) =>
+          request(
             {
               ...input,
-              path: `${repositoryPath(repo.repository)}/pulls?state=${input.state === "merged" ? "closed" : input.state}&head=${encodeURIComponent(branch)}&sort=recentupdate&limit=50&page=${page}`,
+              path: `${repositoryPath(repo.repository)}/pulls?state=all&head=${encodeURIComponent(branch)}&sort=recentupdate&limit=50&page=${page}`,
             },
             Schema.Array(ForgejoPullRequestSchema),
-          );
+          ).pipe(Effect.tapError(() => Effect.sync(() => headMemo.delete(memoKey))));
+        let items = yield* readPage(1);
+        const newest = items[0];
+        const top = newest
+          ? `${newest.number}:${Option.match(newest.updated_at ?? Option.none(), {
+              onNone: () => "",
+              onSome: DateTime.formatIso,
+            })}`
+          : "";
+        const now = yield* Clock.currentTimeMillis;
+        const memo = headMemo.get(memoKey);
+        if (memo !== undefined && memo.top === top && now - memo.at < MEMO_MAX_AGE_MS) {
+          const hits = memo.results.filter(wanted);
+          if (memo.complete || hits.length >= limit) return hits.slice(0, limit);
+        }
+        const found: ChangeRequest[] = [];
+        let matched = 0;
+        let complete = false;
+        for (let page = 1; matched < limit; page++) {
+          if (page > 1) items = yield* readPage(page);
           for (const item of items) {
             if (
               item.head.ref !== branch ||
@@ -350,11 +400,16 @@ export const make = Effect.gen(function* () {
             )
               continue;
             const normalized = toForgejoChangeRequest(item);
-            if (input.state === "all" || normalized.state === input.state) results.push(normalized);
+            found.push(normalized);
+            if (wanted(normalized)) matched++;
           }
-          if (items.length === 0) break;
+          if (items.length === 0) {
+            complete = true;
+            break;
+          }
         }
-        return results.slice(0, limit);
+        rememberHeadWalk(memoKey, { top, at: now, complete, results: found });
+        return found.filter(wanted).slice(0, limit);
       },
       (effect, input) => effect.pipe(mapError("listChangeRequests", input.cwd)),
     ),

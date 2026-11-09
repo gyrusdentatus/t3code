@@ -1,6 +1,7 @@
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as TestClock from "effect/testing/TestClock";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -870,6 +871,181 @@ it.effect("names the web server behind an SSH alias from the login that serves i
     ),
   ),
 );
+
+type FakePull = ReturnType<typeof fakePull>;
+const fakePull = (
+  number: number,
+  head: string,
+  options: { state?: "open" | "closed"; updatedAt?: string; base?: string } = {},
+) => ({
+  number,
+  title: `Pull ${number}`,
+  html_url: `https://forgejo.test/maria/project/pulls/${number}`,
+  state: options.state ?? "open",
+  merged: false,
+  base: { ref: options.base ?? "main", sha: "base", repo: null },
+  head: { ref: head, sha: "head", repo: null },
+  updated_at: options.updatedAt ?? "2026-10-01T00:00:00Z",
+});
+const unrelated = (from: number, count: number): Array<FakePull> =>
+  Array.from({ length: count }, (_, index) => fakePull(from + index, "other"));
+
+// A Forgejo that ignores `head=`: every call sees the whole list, `pageSize` rows at a time.
+const listBranchPulls = (
+  repository: string,
+  headSelector: string,
+  state: "open" | "closed" | "merged" | "all",
+  server: { pulls: () => Array<FakePull>; pageSize?: number },
+  paths: Array<string>,
+  limit = 20,
+) =>
+  Effect.gen(function* () {
+    const provider = yield* ForgejoSourceControlProvider.make;
+    return yield* provider.listChangeRequests({ cwd: "/repo", headSelector, state, limit });
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        Layer.succeed(FileSystem.FileSystem, FileSystem.makeNoop({})),
+        TestSourceControlHost.layer({ process: {} }),
+        Layer.mock(ForgejoCli.ForgejoCli)({
+          resolveRepository: () =>
+            Effect.succeed({ login: "work", repository, baseUrl: "https://forgejo.test" }),
+          api: (input) => {
+            paths.push(input.path);
+            const page = Number(new URLSearchParams(input.path.split("?")[1]).get("page"));
+            const size = server.pageSize ?? 50;
+            const rows = server.pulls().slice((page - 1) * size, page * size);
+            return encodeJsonEffect(rows).pipe(Effect.orDie, Effect.map(processOutput));
+          },
+        }),
+      ),
+    ),
+  );
+const pullRequests = (paths: ReadonlyArray<string>) =>
+  paths.filter((path) => path.includes("/pulls?")).length;
+
+it.effect("walks a branch without pull requests once, then asks one page per poll", () => {
+  const paths: Array<string> = [];
+  const server = { pulls: () => unrelated(1, 150) };
+  return Effect.gen(function* () {
+    const first = yield* listBranchPulls("maria/memo-a", "feature", "open", server, paths);
+    assert.deepStrictEqual(first, []);
+    assert.strictEqual(pullRequests(paths), 4);
+    const second = yield* listBranchPulls("maria/memo-a", "feature", "open", server, paths);
+    assert.deepStrictEqual(second, []);
+    assert.strictEqual(pullRequests(paths), 5);
+  });
+});
+
+it.effect("walks again when the newest pull request changed", () => {
+  const paths: Array<string> = [];
+  let top = unrelated(1, 1)[0]!;
+  const server = { pulls: () => [top, ...unrelated(2, 149)] };
+  return Effect.gen(function* () {
+    yield* listBranchPulls("maria/memo-b", "feature", "open", server, paths);
+    assert.strictEqual(pullRequests(paths), 4);
+    top = { ...top, updated_at: "2026-10-02T00:00:00Z" };
+    yield* listBranchPulls("maria/memo-b", "feature", "open", server, paths);
+    assert.strictEqual(pullRequests(paths), 8);
+  });
+});
+
+it.effect("finds a pull request headed by the default branch", () => {
+  const paths: Array<string> = [];
+  const server = { pulls: () => [fakePull(900, "main", { base: "release" }), ...unrelated(1, 10)] };
+  return Effect.gen(function* () {
+    const found = yield* listBranchPulls("maria/memo-c1", "main", "open", server, paths);
+    assert.deepStrictEqual(
+      found.map((pull) => pull.number),
+      [900],
+    );
+  });
+});
+
+it.effect("finds a pull request on page 3", () => {
+  const paths: Array<string> = [];
+  const server = {
+    pulls: () => [...unrelated(1, 100), fakePull(901, "feature"), ...unrelated(200, 20)],
+  };
+  return Effect.gen(function* () {
+    const found = yield* listBranchPulls("maria/memo-c2", "feature", "open", server, paths);
+    assert.deepStrictEqual(
+      found.map((pull) => pull.number),
+      [901],
+    );
+  });
+});
+
+it.effect("finds a pull request when the server caps pages below 50 rows", () => {
+  const paths: Array<string> = [];
+  const server = {
+    pageSize: 30,
+    pulls: () => [...unrelated(1, 40), fakePull(902, "feature")],
+  };
+  return Effect.gen(function* () {
+    const found = yield* listBranchPulls("maria/memo-c3", "feature", "open", server, paths);
+    assert.deepStrictEqual(
+      found.map((pull) => pull.number),
+      [902],
+    );
+  });
+});
+
+it.effect("drops a pull request that was closed after the last walk", () => {
+  const paths: Array<string> = [];
+  let pulls = [
+    fakePull(1, "other", { updatedAt: "2026-10-03T00:00:00Z" }),
+    fakePull(5, "feature", { updatedAt: "2026-10-02T00:00:00Z" }),
+    ...unrelated(10, 5),
+  ];
+  const server = { pulls: () => pulls };
+  return Effect.gen(function* () {
+    const before = yield* listBranchPulls("maria/memo-d", "feature", "open", server, paths);
+    assert.deepStrictEqual(
+      before.map((pull) => pull.number),
+      [5],
+    );
+    pulls = [
+      fakePull(5, "feature", { state: "closed", updatedAt: "2026-10-04T00:00:00Z" }),
+      pulls[0]!,
+      ...pulls.slice(2),
+    ];
+    const after = yield* listBranchPulls("maria/memo-d", "feature", "open", server, paths);
+    assert.deepStrictEqual(after, []);
+    assert.isTrue(
+      paths.every((path) => new URLSearchParams(path.split("?")[1]).get("state") === "all"),
+    );
+  });
+});
+
+it.effect("keeps one memo per branch", () => {
+  const paths: Array<string> = [];
+  const server = { pulls: () => [fakePull(1, "alpha"), ...unrelated(10, 5)] };
+  return Effect.gen(function* () {
+    const alpha = yield* listBranchPulls("maria/memo-f", "alpha", "open", server, paths);
+    const beta = yield* listBranchPulls("maria/memo-f", "beta", "open", server, paths);
+    assert.deepStrictEqual(
+      alpha.map((pull) => pull.number),
+      [1],
+    );
+    assert.deepStrictEqual(beta, []);
+  });
+});
+
+it.effect("walks again once the memo is older than fifteen minutes", () => {
+  const paths: Array<string> = [];
+  const server = { pulls: () => unrelated(1, 60) };
+  return Effect.gen(function* () {
+    yield* listBranchPulls("maria/memo-e", "feature", "open", server, paths);
+    assert.strictEqual(pullRequests(paths), 3);
+    yield* TestClock.adjust("14 minutes");
+    yield* listBranchPulls("maria/memo-e", "feature", "open", server, paths);
+    assert.strictEqual(pullRequests(paths), 4);
+    yield* TestClock.adjust("2 minutes");
+    yield* listBranchPulls("maria/memo-e", "feature", "open", server, paths);
+    assert.strictEqual(pullRequests(paths), 7);
+  });
+});
 
 it.effect("loads Forgejo pull request references from files and commits views", () =>
   Effect.gen(function* () {
